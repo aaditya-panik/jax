@@ -2219,6 +2219,17 @@ jax_ragged_dot_use_ragged_dot_instruction = bool_state(
     ),
 )
 
+jax_ragged_dot_use_gpu_pallas_triton_lowering = bool_state(
+    name='jax_ragged_dot_use_gpu_pallas_triton_lowering',
+    default=False,
+    help=(
+        '(GPU only) If True, use Pallas Triton lowering for ragged_dot()'
+        ' lowering. Otherwise, rely on the rollout logic in lowering rule for'
+        ' ragged_dot_general_p.'
+    ),
+    include_in_jit_key=True,
+)
+
 jax_pallas_verbose_errors = bool_flag(
     "jax_pallas_verbose_errors",
     default=bool_env("JAX_PALLAS_VERBOSE_ERRORS", False),

@@ -6323,6 +6323,8 @@ def _ragged_dot_general_lower(
   if group_offset is not None:
     raise NotImplementedError('Unimplemented group_offset support.')
 
+
+
   if not config.jax_ragged_dot_use_ragged_dot_instruction.value:
     result = mlir.lower_fun(_ragged_dot_general_impl, multiple_results=False)(
         ctx, lhs, rhs, group_sizes,
@@ -6381,12 +6383,28 @@ mlir.register_lowering(ragged_dot_general_p,
                        mlir.lower_fun(_ragged_dot_general_impl,
                                       multiple_results=False))
 
-for platform in ['tpu', 'gpu']:
-  mlir.register_lowering(
-      ragged_dot_general_p,
-      partial(_ragged_dot_general_lower, platform=platform),
-      platform=platform,
-  )
+# on TPU lower to the TPU mosaic kernel
+mlir.register_lowering(
+    ragged_dot_general_p,
+    partial(_ragged_dot_general_lower, platform='tpu'),
+    platform='tpu',
+)
+
+def _ragged_dot_general_lower_on_gpu(ctx, *args, **kwargs):
+  from jax._src.lax.pallas_lowerings.gpu import ragged_dot as pallas_ragged_dot
+  if (config.jax_ragged_dot_use_gpu_pallas_triton_lowering.value
+      and pallas_ragged_dot._backend_supports_triton()):
+    return mlir.lower_fun(pallas_ragged_dot._pallas_ragged_dot_general_impl,
+                          multiple_results=False)(ctx, *args, **kwargs)
+  else:
+    return _ragged_dot_general_lower(ctx, *args, **kwargs, platform='gpu')
+
+# on GPU lower to the pallas kernel with a fallback lowering
+mlir.register_lowering(
+    ragged_dot_general_p,
+    _ragged_dot_general_lower_on_gpu,
+    platform='gpu',
+)
 
 
 def _broadcast_in_dim_shape_rule(operand, *, shape, broadcast_dimensions,
