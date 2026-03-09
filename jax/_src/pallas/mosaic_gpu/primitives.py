@@ -504,6 +504,7 @@ def _copy_gmem_to_smem_lowering(
     barrier_transforms_treedef,
     collective_axes,
     leader_tracked,
+    oob_mode,
     for_warpgroup: bool = True,
 ):
   flat_src_transforms, flat_dst_transforms, flat_barrier_transforms = (
@@ -568,6 +569,19 @@ def _copy_gmem_to_smem_lowering(
         f" dtype={dst_ty.element_type})"
     )
   bytes = bits // 8
+
+  match oob_mode:
+    case "promise_in_bounds":
+      oob_mode_enum = mgpu.OOBFillMode.PROMISE_IN_BOUNDS
+    case "zeros":
+      oob_mode_enum = mgpu.OOBFillMode.ZEROS
+    case None:
+      oob_mode_enum = mgpu.OOBFillMode.UNDEFINED
+    case _:
+      raise ValueError(
+          f"Invalid OOB fill mode: {oob_mode}. Must be one of"
+          " 'promise_in_bounds', 'zeros' or None."
+      )
 
   if is_leader_tracked_copy:
     # Leader receives the completion messages from both CTAs.
@@ -640,6 +654,7 @@ def _copy_gmem_to_smem_lowering(
         arrive=False,
         collective=collective,
         leader_tracked=leader_tracked,
+        oob_mode=oob_mode_enum,
         **copy_params,
         **predicate_kwarg,  # pyrefly: ignore[bad-argument-type]
     )
@@ -667,6 +682,7 @@ def _copy_gmem_to_smem_lowering(
       collective=ir.ArrayAttr.get(
           [ir.IntegerAttr.get(i32, axis) for axis in collective or []]
       ),
+      oob_fill_mode=ir.IntegerAttr.get(i32, oob_mode_enum.value)
   )
   return ()
 
@@ -685,6 +701,7 @@ def copy_gmem_to_smem(
     *,
     collective_axes: str | tuple[str, ...] | None = None,
     leader_tracked: CopyPartition | None = None,
+    oob_mode: Literal["promise_in_bounds", "zeros"] | None = None,
 ) -> None:
   """Asynchronously copies a GMEM reference to a SMEM reference.
 
@@ -720,6 +737,8 @@ def copy_gmem_to_smem(
      observe the completion of the copy. If ``CopyPartition.PARTITIONED(axis)``,
      performs a partitioned collective copy along the given axis. If
      ``CopyPartition.REPLICATED``, all blocks load the same data.
+    oob_mode: The optional out-of-bounds fill mode. Can be "promise_in_bounds"
+     or "zeros".
 
   See also:
     :func:`jax.experimental.pallas.mosaic_gpu.barrier_arrive`
@@ -761,6 +780,7 @@ def copy_gmem_to_smem(
       barrier_transforms_treedef=barrier_transforms_treedef,
       collective_axes=collective_axes,
       leader_tracked=leader_tracked,
+      oob_mode=oob_mode,
   )
   return None
 

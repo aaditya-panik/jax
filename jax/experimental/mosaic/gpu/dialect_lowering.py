@@ -1046,6 +1046,7 @@ def _mgpu_async_load_op_lowering_rule(
   # TODO(dasenov): Add support for the remaining op properties.
   if ctx.auto_barriers:
     utils.warpgroup_barrier()  # Make sure the writes have completed.
+  oob_mode = lc.OOBFillMode(load_op.oob_fill_mode.value)
   ctx.launch_context.async_copy(
       src_ref=load_op.source,
       dst_ref=unwrapped_dst,
@@ -1055,6 +1056,7 @@ def _mgpu_async_load_op_lowering_rule(
       arrive=False,
       swizzle=swizzle,
       gmem_transform=transforms,
+      oob_mode=oob_mode,
       **predicate,
   )
   return []
