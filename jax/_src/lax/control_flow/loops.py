@@ -33,44 +33,45 @@ from jax._src import dtypes
 from jax._src import effects
 from jax._src import linear_util as lu
 from jax._src import literals
+from jax._src import sharding_impls as sharding
 from jax._src import source_info_util
 from jax._src import state
 from jax._src import util
-from jax._src.api_util import (
-    check_no_aliased_ref_args, _check_no_aliased_closed_over_refs,
+from jax._src import xla_bridge as xb
+from jax._src.api_util import ( _check_no_aliased_closed_over_refs,
+    check_no_aliased_ref_args,
     check_no_transformed_refs_args)
-from jax._src.core import (
-  ShapedArray, typeof, cur_qdd, ClosedJaxpr, AbstractValue)
+from jax._src.core import ( AbstractValue, ClosedJaxpr,
+  ShapedArray, cur_qdd, typeof)
 from jax._src.interpreters import ad
 from jax._src.interpreters import batching
 from jax._src.interpreters import mlir
 from jax._src.interpreters import partial_eval as pe
 from jax._src.interpreters import pxla
-from jax._src import sharding_impls as sharding
-from jax._src.mesh import use_abstract_mesh
 from jax._src.lax import lax
-from jax._src.lax import utils as lax_utils
 from jax._src.lax import slicing
+from jax._src.lax import utils as lax_utils
 from jax._src.lax import windowed_reductions
 from jax._src.lax.control_flow.common import (
-    _avals_short, _prune_zeros, _typecheck_param,
-    _make_closed_jaxpr)
+    _avals_short,
+    _make_closed_jaxpr, _prune_zeros, _typecheck_param)
 from jax._src.lax.other import logaddexp
-from jax._src.pjit import auto_axes, PartitionSpec as P, reshard
 from jax._src.lib.mlir import ir
+from jax._src.lib.mlir.dialects import chlo
 from jax._src.lib.mlir.dialects import hlo
+from jax._src.mesh import use_abstract_mesh
+from jax._src.pjit import PartitionSpec as P, auto_axes, reshard
 from jax._src.sharding_impls import canonicalize_sharding
-from jax._src.state import discharge as state_discharge, AbstractRef
+from jax._src.state import AbstractRef, discharge as state_discharge
 from jax._src.traceback_util import api_boundary
 from jax._src.tree_util import equality_errors
+from jax._src.tree_util import ( FlatTree,
+    keystr, tree_flatten, tree_map, tree_unflatten,
+    treedef_is_leaf)
 from jax._src.typing import Array
 from jax._src.util import (
     merge_lists, partition_list, safe_map, safe_zip, split_list,
-    split_list_checked, unzip2, weakref_lru_cache, subs_list)
-from jax._src import xla_bridge as xb
-from jax._src.tree_util import (
-    keystr, tree_flatten, tree_map, tree_unflatten,
-    treedef_is_leaf, FlatTree)
+    split_list_checked, subs_list, unzip2, weakref_lru_cache)
 import numpy as np
 
 _map = safe_map
@@ -2769,6 +2770,85 @@ def _interleave(a, b, axis):
 
 ### Cumulative reductions.
 
+
+def _get_identity(p, dtype):
+  if p is cumsum_p:
+    return lax._const(dtype, 0)
+  if p is cumprod_p:
+    return lax._const(dtype, 1)
+  if p is cummax_p:
+    return lax._get_max_identity(dtype)
+  if p is cummin_p:
+    return lax._get_min_identity(dtype)
+  raise ValueError(f'Unknown cumulative reduction primitive {p}')
+
+
+def _get_reducer(p):
+  if p is cumsum_p:
+    return hlo.add
+  if p is cumprod_p:
+    return hlo.multiply
+  if p is cummax_p:
+    return hlo.maximum
+  if p is cummin_p:
+    return hlo.minimum
+  raise ValueError(f'Unknown cumulative reduction primitive {p}')
+
+
+def _cumred_chlo_lowering(ctx, x, *, axis, reverse):
+  prim = ctx.primitive
+  dtype = ctx.avals_in[0].dtype
+  init_val = _get_identity(prim, dtype)
+  et = x.type.element_type
+  es = x.type.shape[:axis] + x.type.shape[axis + 1 :]
+  element_type = ir.RankedTensorType.get(es, et)
+  if es:
+    init = hlo.BroadcastInDimOp(
+        element_type,
+        mlir.ir_constant(init_val),
+        ir.DenseI64ArrayAttr.get([]),
+    ).result
+  else:
+    init = mlir.ir_constant(init_val)
+
+  scan_op = chlo.ScanOp(
+      [x.type],
+      [element_type],
+      [x],
+      [init],
+      dimension=ir.IntegerAttr.get(ir.IntegerType.get_signless(64), axis),
+      is_reverse=ir.BoolAttr.get(reverse),
+      is_associative=ir.BoolAttr.get(True),
+  )
+  body_block = scan_op.body.blocks.append(element_type, element_type)
+  with ir.InsertionPoint(body_block):
+    x_arg, carry_arg = body_block.arguments
+    op = _get_reducer(prim)
+    res = op(x_arg, carry_arg)
+    hlo.return_([res, res])
+  return scan_op.results[:1]
+
+
+def _is_supported_cumred(input, reverse, axis):
+  return (
+      not reverse
+      and axis == 0
+      and input.shape[axis] > 0
+      and core.is_constant_dim(input.shape[axis])
+      and input.dtype != np.bool_
+      and not np.issubdtype(input.dtype, np.complexfloating)
+  )
+
+
+def _cumred_gpu_lowering(reduce_window_fn: Callable, ctx, x, *, axis, reverse):
+  if not _is_supported_cumred(ctx.avals_in[0], reverse, axis):
+    fun = partial(cumred_reduce_window_impl, reduce_window_fn)
+    return mlir.lower_fun(fun, multiple_results=False)(
+        ctx, x, axis=axis, reverse=reverse
+    )
+  return _cumred_chlo_lowering(ctx, x, axis=axis, reverse=reverse)
+
+
 def cumsum(operand: Array, axis: int = 0, reverse: bool = False) -> Array:
   """Computes a cumulative sum along `axis`."""
   return cumsum_p.bind(operand, axis=int(axis), reverse=bool(reverse))
@@ -2880,3 +2960,9 @@ ad.primitive_jvps[cumlogsumexp_p] = partial(_cumulative_jvp_rule, combine_fn=log
 ad.primitive_jvps[cumprod_p] = partial(_cumulative_jvp_rule, combine_fn=lax.mul)
 ad.primitive_jvps[cummin_p] = partial(_cumulative_jvp_rule, combine_fn=lax.min)
 ad.primitive_jvps[cummax_p] = partial(_cumulative_jvp_rule, combine_fn=lax.max)
+
+mlir.register_lowering(
+    cumsum_p,
+    partial(_cumred_gpu_lowering, windowed_reductions._reduce_window_sum),
+    platform='gpu',
+)

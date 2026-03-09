@@ -85,6 +85,10 @@ class PrimitiveTest(jtu.JaxTestCase):
     if harness.params.get("enable_xla", False):
       self.skipTest("enable_xla=False is not relevant")
 
+    # TODO(b/469020791): Remove 4 weeks after cl/876873412 was submitted.
+    if harness.group_name in ("cumsum",):
+      self.skipTest("composite_v2 downgrade failure due to regions")
+
     func_jax = harness.dyn_fun
     args = harness.dyn_args_maker(self.rng())
 

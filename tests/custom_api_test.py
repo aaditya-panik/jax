@@ -996,6 +996,10 @@ class CustomJVPTest(jtu.JaxTestCase):
     self.assertEqual(grad(energy_fn)(scalar_box).shape, ())
 
   def test_custom_jvp_implicit_broadcasting(self):
+    # TODO(b/469020791): Remove 4 weeks after cl/876873412 was submitted.
+    if jtu.device_under_test() == "gpu":
+      raise unittest.SkipTest("composite_v2 downgrade failure due to regions")
+
     # https://github.com/jax-ml/jax/issues/6357
     if config.enable_x64.value:
       raise unittest.SkipTest("test only applies when x64 is disabled")

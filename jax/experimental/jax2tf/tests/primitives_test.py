@@ -117,6 +117,10 @@ class JaxPrimitiveTest(tf_test_util.JaxToTfTestCase):
     if device == "gpu" and "lu" in harness.fullname:
       raise unittest.SkipTest("b/269388847: lu failures on GPU")
 
+    # TODO(b/469020791): Remove 4 weeks after cl/876873412 was submitted.
+    if harness.group_name in ("cumsum",) and device == "gpu":
+      raise unittest.SkipTest("composite_v2 downgrade failure due to regions")
+
     def skipCustomCallTest(target: str):
       raise unittest.SkipTest(
           f"TODO(b/272239584): custom call target not guaranteed stable: {target}")
