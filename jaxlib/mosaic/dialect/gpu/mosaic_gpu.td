@@ -508,6 +508,7 @@ def MosaicGPU_SliceSMEMOp : Op<MosaicGPU_Dialect, "slice_smem", [Pure]> {
 
   let arguments = (ins I32:$offset);
   let results = (outs AnyMemRef);
+  let hasCanonicalizer = 1;
 }
 
 def MosaicGPU_WGMMASupportedABType : AnyTypeOf<[F16, BF16, TF32, F32, F8E4M3FN, F8E5M2, I8],

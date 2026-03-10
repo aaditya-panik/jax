@@ -60,6 +60,7 @@ limitations under the License.
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/OperationSupport.h"
+#include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/Region.h"
 #include "mlir/IR/TypeRange.h"
 #include "mlir/IR/Types.h"
@@ -1092,6 +1093,33 @@ llvm::LogicalResult OptimizationBarrierOp::inferReturnTypes(
   mlir::TypeRange operand_types = operands.getTypes();
   inferredReturnTypes.assign(operand_types.begin(), operand_types.end());
   return mlir::success();
+}
+
+namespace {
+
+struct FoldReinterpretCastOfSliceSMEM
+    : public mlir::OpRewritePattern<mlir::memref::ReinterpretCastOp> {
+  using OpRewritePattern::OpRewritePattern;
+
+  mlir::LogicalResult matchAndRewrite(
+      mlir::memref::ReinterpretCastOp op,
+      mlir::PatternRewriter& rewriter) const override {
+    auto slice_op = op.getSource().getDefiningOp<SliceSMEMOp>();
+    if (!slice_op) {
+      return mlir::failure();
+    }
+
+    MemRefType result_type = op.getType();
+    rewriter.replaceOpWithNewOp<SliceSMEMOp>(op, result_type,
+                                             slice_op.getOffset());
+    return mlir::success();
+  }
+};
+}  // namespace
+
+void SliceSMEMOp::getCanonicalizationPatterns(mlir::RewritePatternSet& patterns,
+                                              mlir::MLIRContext* context) {
+  patterns.add<FoldReinterpretCastOfSliceSMEM>(context);
 }
 
 void MosaicGPUDialect::initialize() {
