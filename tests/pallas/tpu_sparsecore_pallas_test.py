@@ -503,7 +503,7 @@ class VectorSubcoreTest(PallasSCTest):
     indices = jax.random.permutation(jax.random.key(42), x)
 
     @self.vector_subcore_kernel(
-        out_shape=jax.ShapeDtypeStruct(shape=[1, *x.shape], dtype=x.dtype),
+        out_shape=jax.ShapeDtypeStruct(shape=x.shape, dtype=x.dtype),
         in_specs=(
             pl.BlockSpec(memory_space=pltpu.HBM),
             pl.BlockSpec(memory_space=pltpu.VMEM),
@@ -512,13 +512,7 @@ class VectorSubcoreTest(PallasSCTest):
     def kernel(x_hbm_ref, indices_ref, o_ref):
       pltpu.sync_copy(x_hbm_ref.at[indices_ref], o_ref)
 
-    # We have to expand the arrays to 2D to ensure that the pipeline stage
-    # dimension does not get tiled when using TC tiling.
-    # TODO(b/488280660): Remove this once the bug is fixed.
-    result = jnp.squeeze(
-        kernel(jnp.expand_dims(x, 0), jnp.expand_dims(indices, 0))
-    )
-    np.testing.assert_array_equal(result, x[indices])
+    np.testing.assert_array_equal(kernel(x, indices), x[indices])
 
   def test_gather_1d_with_indexing(self):
     self.skip_if_tc_tiling("Small 1d gather does not work on TC tiling.")

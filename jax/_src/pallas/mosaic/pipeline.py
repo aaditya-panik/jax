@@ -449,6 +449,7 @@ class BufferedRef(BufferedRefBase):
   """
   _spec: pl.BlockSpec = dataclasses.field(metadata=dict(static=True))
   _buffer_type: BufferType = dataclasses.field(metadata=dict(static=True))
+  _buffer_count: int = dataclasses.field(metadata=dict(static=True))
   window_ref: ArrayRef | None
   accum_ref: ArrayRef | None
   copy_in_slot: ArrayRef | None
@@ -504,7 +505,7 @@ class BufferedRef(BufferedRefBase):
     """Returns the number of buffers used for multiple buffering."""
     if not self.is_buffered:
       raise ValueError("buffer count is undefined")
-    return self.window_ref.shape[0]  # type: ignore[union-attr]
+    return self._buffer_count
 
   @staticmethod
   def buffer_types() -> type[BufferType]:
@@ -518,7 +519,7 @@ class BufferedRef(BufferedRefBase):
       buffer_type,
       buffer_count,
       needs_swap_ref=True,
-      grid_rank=0,
+      grid=None,
       use_lookahead=False,
       source_memory_space: tpu_core.MemorySpace | Literal[ANY] = ANY,  # type: ignore[valid-type]
       tiling: tpu_info.Tiling | None = None,
@@ -532,7 +533,7 @@ class BufferedRef(BufferedRefBase):
       buffer_type: enum indicating whether this is an input, output, or in/out
         accumulator buffered reference.
       needs_swap_ref: whether a swap slots tracker needs to be allocated.
-      grid_rank: rank of the pipeline grid.
+      grid: the pipeline grid.
       use_lookahead: whether to enable pipeline lookahead.
       source_memory_space: The memory space of the backing source Ref.
       tiling: The tiling to assume for the buffers.
@@ -564,6 +565,7 @@ class BufferedRef(BufferedRefBase):
       return cls(
           _spec=spec,
           _buffer_type=buffer_type,
+          _buffer_count=0,
           window_ref=None,  # to be bound to existing ref by the pipeline routine
           accum_ref=accum_ref,
           copy_in_slot=None,
@@ -582,15 +584,26 @@ class BufferedRef(BufferedRefBase):
           tiling=None,
       )
     else:
-      if use_lookahead and grid_rank is None:
-        raise ValueError(
-            "grid_rank must be specified when use_lookahead is True."
+      assert grid is not None
+      if len(block_shape) == 1 and tiling is not tpu_info.Tiling.SPARSE_CORE:
+        grid_is_trivial = (
+            isinstance(grid_size := _grid_size(grid), int) and grid_size == 1,
         )
-
-      buffer_ty = ty.update(shape=(buffer_count, *block_shape))
+        [tiling_dim] = tpu_info.infer_tiling(ty, tiling)
+        assert tiling_dim is not None
+        # TODO(slebedev): Use ``buffer_count > 1`` as the condition instead,
+        # once we adjust buffering for trivial grids.
+        if not grid_is_trivial and block_shape[-1] % tiling_dim:
+          raise ValueError(
+              f"1D {block_shape=} must be a multiple of {tiling_dim=}"
+          )
+        buffer_ty = ty.update(shape=(buffer_count * block_shape[0],))
+      else:
+        buffer_ty = ty.update(shape=(buffer_count, *block_shape))
       return cls(
           _spec=spec,
           _buffer_type=buffer_type,
+          _buffer_count=buffer_count,
           window_ref=buffer_memory_space.from_type(buffer_ty),
           accum_ref=accum_ref,
           copy_in_slot=SMEM((1,), jnp.uint32) if buffer_type.is_input else None,
@@ -601,8 +614,9 @@ class BufferedRef(BufferedRefBase):
           _wait_in_slot_reg=None,
           _copy_out_slot_reg=None,
           _wait_out_slot_reg=None,
-          next_fetch_smem=[SMEM((1,), jnp.int32) for _ in range(
-              grid_rank)] if use_lookahead else None,
+          next_fetch_smem=[SMEM((1,), jnp.int32) for _ in range(len(grid))]
+          if use_lookahead
+          else None,
           next_fetch_sreg=None,
           sem_recvs=(
               None
@@ -691,7 +705,7 @@ class BufferedRef(BufferedRefBase):
         slot = self.current_copy_out_slot
       else:
         slot = self.current_wait_in_slot
-      return self.window_ref.at[slot]
+      return self._window_ref_at(slot)
 
   def _cumulative(self, smem_slot, reg_slot):
     if reg_slot is not None:
@@ -937,6 +951,21 @@ class BufferedRef(BufferedRefBase):
         assert self._wait_out_slot_reg is not None
         self.wait_out_slot[0] = self._wait_out_slot_reg
 
+  def _window_ref_at(self, slot, window_slice=None):
+    assert self.window_ref is not None
+    if self.window_ref.ndim > 1:
+      return self.window_ref.at[(slot, *(window_slice or ()))]
+
+    # 1D ``window_ref`` stores all slots contiguously.
+    n = self.window_ref.shape[0] // self.buffer_count
+    if window_slice is None:
+      return self.window_ref.at[pl.ds(slot * n, n)]
+    assert len(window_slice) == 1
+    return self.window_ref.at[
+        # pyrefly: ignore[attribute-error]
+        pl.ds(slot * n + window_slice[0].start, window_slice[0].size)
+    ]
+
   def copy_in(self, src_ref, grid_indices):
     """Starts copy of HBM dma slice into the current slot."""
     assert self.is_input
@@ -950,7 +979,7 @@ class BufferedRef(BufferedRefBase):
     dst_slice = self._to_window_slice(src_slice)
     tpu_primitives.make_async_copy(
         src_ref.at[src_slice],
-        self.window_ref.at[(slot, *dst_slice)],
+        self._window_ref_at(slot, dst_slice),
         self.sem_recvs.at[slot],
     ).start()
 
@@ -966,7 +995,7 @@ class BufferedRef(BufferedRefBase):
     dst_slice = self.get_dma_slice(_ref_to_value_aval(dst_ref), grid_indices)
     src_slice = self._to_window_slice(dst_slice)
     tpu_primitives.make_async_copy(
-        self.window_ref.at[(slot, *src_slice)],
+        self._window_ref_at(slot, src_slice),
         dst_ref.at[dst_slice],
         self.sem_sends.at[slot],
     ).start()
@@ -982,9 +1011,9 @@ class BufferedRef(BufferedRefBase):
     wait_slot = self.current_wait_in_slot
     tpu_primitives.make_async_copy(
         src_ref.at[src_slice],  # nb: doesn't matter
-        self.window_ref.at[
-            (wait_slot, *dst_slice)
-        ],  # only dst shape is important
+        self._window_ref_at(
+            wait_slot, dst_slice
+        ),  # only dst shape is important
         self.sem_recvs.at[wait_slot],
     ).wait()
 
@@ -998,7 +1027,7 @@ class BufferedRef(BufferedRefBase):
     dst_slice = self.get_dma_slice(_ref_to_value_aval(dst_ref), grid_indices)
     src_slice = self._to_window_slice(dst_slice)
     tpu_primitives.make_async_copy(
-        self.window_ref.at[(wait_slot, *src_slice)],  # nb: doesn't matter
+        self._window_ref_at(wait_slot, src_slice),  # nb: doesn't matter
         dst_ref.at[dst_slice],  # only dst shape is important
         self.sem_sends.at[wait_slot],
     ).wait()
@@ -1706,7 +1735,7 @@ def make_pipeline_allocations(
         in_aval,
         buffer_count,
         needs_swap_ref=needs_swap_ref,
-        grid_rank=len(grid),
+        grid=grid,
         use_lookahead=use_lookahead,
         source_memory_space=in_ref.memory_space,
         tiling=tiling,
@@ -1735,6 +1764,7 @@ def make_pipeline_allocations(
         out_aval,
         buffer_count,
         needs_swap_ref=needs_swap_ref,
+        grid=grid,
         source_memory_space=out_ref.memory_space,
         tiling=tiling,
     )
