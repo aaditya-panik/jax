@@ -26,6 +26,7 @@ from jax._src.interpreters import mlir as mlir_interpreter
 from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import arith
 from jax._src.lib.mlir.dialects import builtin
+from jax._src.lib.mlir.dialects import func
 from jax._src.lib.mlir.dialects import gpu
 from jax._src.lib.mlir.dialects import llvm
 from jax._src.lib.mlir.dialects import memref
@@ -1319,6 +1320,46 @@ ir.MLIRError,
     ):
       self.module.operation.verify()
 
+  def test_contiguous_reinterpret_cast_of_slice_smem_is_folded(self):
+    shape, new_shape = (4, 8), (32,)
+    new_offsets, new_strides = [0], [1]
+    ty = ir.MemRefType.get(shape, ir.BF16Type.get(), memory_space=mgpu_utils.smem())
+    new_ty = ir.MemRefType.get(
+        new_shape,
+        ty.element_type,
+        layout=ir.StridedLayoutAttr.get(0, new_strides),
+        memory_space=ty.memory_space,
+    )
+    with ir.InsertionPoint(self.module.body):
+      fn = func.FuncOp("test_fn", ir.FunctionType.get([], [new_ty]))
+      block = fn.add_entry_block()
+      with ir.InsertionPoint(block):
+        ref = mgpu.dialect.slice_smem(
+            ty, offset=mgpu_utils.c(0, ir.IntegerType.get_signless(32)),
+        )
+        result = memref.reinterpret_cast(
+            new_ty,
+            ref,
+            [],
+            [],
+            [],
+            static_offsets=new_offsets,
+            static_sizes=new_shape,
+            static_strides=new_strides,
+        )
+        func.ReturnOp([result])
+
+    pm = mlir_interpreter.passmanager.PassManager.parse(
+        "builtin.module(canonicalize)", self.module.context
+    )
+    pm.run(self.module.operation)
+
+    [slice_smem_op] = find_if(
+        self.module,
+        lambda op: op.name == mgpu.dialect.SliceSMEMOp.OPERATION_NAME,
+    )
+    self.assertEqual(slice_smem_op.result.type, new_ty)
+
 
 class DialectLoweringTest(MosaicGpuTest):
 
@@ -1754,49 +1795,38 @@ class DialectLoweringTest(MosaicGpuTest):
         tuple(tiled_strides), expected_tile_strides + expected_tiling_strides
     )
 
-  def _tile_shape_type_inference_test_base(self, shape, tiling, layout=None):
-    i32 = ir.IntegerType.get_signless(32)
-    with ir.InsertionPoint(self.module.body):
-      ref_ty = ir.MemRefType.get(
-          shape, i32, memory_space=mgpu_utils.smem(), layout=layout
-      )
-      [smem] = undefs(ref_ty)
-      mgpu.dialect.tile_shape(smem, tiling)
+  def test_untile_tile_sliced_transposed_memref_type_is_identity(self):
+    strides = mgpu_utils.get_contiguous_strides((512, 256))
+    offset = 128 * 256 + 32
+    tiling = (8, 16)
+    # This type is equivalent to the type of `y` in
+    #   y = x[128:256, 32:96].T
+    # given `x` a contiguous ref of shape (512, 256).
+    ref_ty = ir.MemRefType.get(
+        (64, 128),
+        ir.BF16Type.get(),
+        memory_space=mgpu_utils.smem(),
+        layout=ir.StridedLayoutAttr.get(offset, strides[::-1]),
+    )
+    tiled_type = lowering.tile_type(ref_ty, tiling)
+    untiled_type = lowering.untile_type(tiled_type, tiling)
+    self.assertEqual(untiled_type, ref_ty)
 
-  def test_tile_shape_raises_on_invalid_tiling(self):
-    with self.assertRaisesRegex(
-        ir.MLIRError, "must be a multiple of the tile size"
-    ):
-      self._tile_shape_type_inference_test_base((128, 128), (16, 33))
-
-  def test_tile_shape_raises_on_invalid_layout(self):
-    with self.assertRaisesRegex(ir.MLIRError, "must have a strided layout"):
-      layout = ir.AffineMapAttr.get(ir.AffineMap.get_permutation((1, 0)))
-      self._tile_shape_type_inference_test_base((128, 128), (16, 32), layout)
-
-  def test_tile_shape_raises_on_invalid_tiling_rank(self):
-    with self.assertRaisesRegex(
-        ir.MLIRError,
-        "must have at least as many dimensions as the tiling",
-    ):
-      self._tile_shape_type_inference_test_base((128,), (16, 32))
-
-  def test_tile_shape_infers_tiled_shape_type(self):
+  def test_tile_type_produces_tiled_shape_type(self):
     i32 = ir.IntegerType.get_signless(32)
     shape, tiling = (256, 128, 128), (16, 32)
     with ir.InsertionPoint(self.module.body):
       ref_ty = ir.MemRefType.get(shape, i32, memory_space=mgpu_utils.smem())
-      [smem] = undefs(ref_ty)
-      tiled_smem = mgpu.dialect.tile_shape(smem, tiling)
+      [smem, tiled_smem] = undefs(ref_ty, lowering.tile_type(ref_ty, tiling))
       tile_then_transpose = mgpu_utils.memref_transpose(
           tiled_smem, (0, 2, 1, 4, 3)
       )
       transposed_smem = mgpu_utils.memref_transpose(smem, (0, 2, 1))
-      transpose_then_tile = mgpu.dialect.tile_shape(transposed_smem, tiling[::-1])
+      transpose_then_tile_ty = lowering.tile_type(transposed_smem.type, tiling[::-1])
     self.assertEqual(tuple(tiled_smem.type.shape), (256, 8, 4, 16, 32))
     self.assertEqual(tuple(tile_then_transpose.type.shape), (256, 4, 8, 32, 16))
     # Check that everything in the type is identical (especially the strides).
-    self.assertEqual(tile_then_transpose.type, transpose_then_tile.type)
+    self.assertEqual(tile_then_transpose.type, transpose_then_tile_ty)
 
 
 if hp is not None:
@@ -1849,7 +1879,7 @@ if hp is not None:
         self.assertEqual(tuple(strides), tuple(expected_strides))
       run()
 
-    def test_transform_type_matches_tile_shape_inference(self):
+    def test_untile_tile_type_is_identity(self):
       @hp.given(shape_permutation_and_tiling())
       def run(args):
         shape, permutation, tiling = args
@@ -1858,12 +1888,9 @@ if hp is not None:
           ref_ty = ir.MemRefType.get(shape, i32, memory_space=mgpu_utils.smem())
           [smem] = undefs(ref_ty)
           transposed_smem = mgpu_utils.memref_transpose(smem, permutation)
-          tiled_smem = mgpu.dialect.tile_shape(transposed_smem, tiling)
-        transforms = (launch_context.TileTransform(tiling),)
-        self.assertEqual(
-            lowering.transform_type(transposed_smem.type, transforms),
-            tiled_smem.type,
-        )
+        tiled_type = lowering.tile_type(transposed_smem.type, tiling)
+        untiled_type = lowering.untile_type(tiled_type, tiling)
+        self.assertEqual(untiled_type, transposed_smem.type)
       run()
 
 
