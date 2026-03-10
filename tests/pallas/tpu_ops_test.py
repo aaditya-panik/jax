@@ -347,9 +347,9 @@ class OpsTest(ptu.PallasTPUTest):
     self.assertArraysEqual(out, expected)
 
   @parameterized.product(
-      dtype = [jnp.float32, jnp.bfloat16, jnp.int32],
-      axis = [0, 1, 2],
-      reduce_func = [jnp.sum, jnp.max, jnp.min]
+      dtype=[jnp.float32, jnp.bfloat16, jnp.int32],
+      axis=[0, 1, 2],
+      reduce_func=[jnp.sum, jnp.max, jnp.min, jnp.prod],
   )
   def test_reduction(self, dtype, axis, reduce_func):
     in_shape = (2, 16, 128)
