@@ -563,6 +563,12 @@ bool isGuaranteedDivisible(Value value, int64_t divisor, int64_t fuel) {
   if (auto cast_op = value.getDefiningOp<arith::IndexCastOp>()) {
     return isGuaranteedDivisible(cast_op.getOperand(), divisor, fuel - 1);
   }
+  if (auto div_op = value.getDefiningOp<arith::DivUIOp>()) {
+    if (auto rhs_cst = mlir::getConstantIntValue(div_op.getRhs())) {
+      return isGuaranteedDivisible(div_op.getLhs(), divisor * *rhs_cst,
+                                   fuel - 1);
+    }
+  }
   if (checkBothOperandsDivisible<arith::AddIOp>(value, divisor, fuel) ||
       checkBothOperandsDivisible<arith::SubIOp>(value, divisor, fuel) ||
       checkBothOperandsDivisible<arith::RemSIOp>(value, divisor, fuel) ||
