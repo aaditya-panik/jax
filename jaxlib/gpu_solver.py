@@ -62,6 +62,13 @@ def initialize_hybrid_kernels():
     _hiphybrid.initialize()
 
 
+def initialize_hybrid_ilp64_lapack():
+  if _cuhybrid:
+    _cuhybrid.initialize_ilp64_lapack()
+  if _hiphybrid:
+    _hiphybrid.initialize_ilp64_lapack()
+
+
 def has_magma():
   if _cuhybrid:
     return _cuhybrid.has_magma()

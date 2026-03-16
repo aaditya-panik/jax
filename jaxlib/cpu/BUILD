@@ -57,6 +57,18 @@ cc_library(
     alwayslink = 1,
 )
 
+cc_library(
+    name = "lapack_kernels_dlopen_lapack64",
+    srcs = ["lapack_kernels_dlopen_lapack64.cc"],
+    hdrs = ["lapack_kernels_dlopen_lapack64.h"],
+    deps = [
+        ":lapack_kernels",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings:str_format",
+        "@xla//xla/tsl/platform:env",
+    ],
+)
+
 nanobind_extension(
     name = "_lapack",
     srcs = ["lapack.cc"],
@@ -75,6 +87,8 @@ nanobind_extension(
     ],
     deps = [
         ":lapack_kernels",
+        ":lapack_kernels_dlopen_lapack64",
+        "//jaxlib:absl_status_casters",
         "//jaxlib:kernel_nanobind_helpers",
         "@nanobind",
         "@xla//xla/ffi/api:ffi",

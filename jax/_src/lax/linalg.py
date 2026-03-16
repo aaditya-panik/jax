@@ -17,6 +17,7 @@ from __future__ import annotations
 from collections.abc import Callable
 import enum
 from functools import partial
+import logging
 import math
 import string
 from typing import Any, Literal, overload
@@ -51,6 +52,56 @@ from jax._src.lib.mlir.dialects import chlo
 from jax._src.lib.mlir.dialects import hlo
 from jax._src.partition_spec import PartitionSpec as P
 from jax._src.typing import Array, ArrayLike
+
+
+logger = logging.getLogger(__name__)
+
+_lapack = lapack._lapack
+
+_LAPACK_DTYPE_PREFIX = {
+    np.float32: "s",
+    np.float64: "d",
+    np.complex64: "c",
+    np.complex128: "z",
+}
+
+def _initialize_gpu_hybrid_kernels():
+  gpu_solver.initialize_hybrid_kernels()
+  if config.jax_cpu_use_ilp64_lapack.value:
+    try:
+      gpu_solver.initialize_hybrid_ilp64_lapack()
+    except Exception as e:
+      logger.info("Failed to load GPU ILP64 LAPACK: %s", e)
+
+def _prepare_lapack_call(fn_base, dtype):
+  """Initializes the LAPACK library and returns the LAPACK target name."""
+  _lapack.initialize()
+  if config.jax_cpu_use_ilp64_lapack.value:
+    # TODO(phawkins): remove this guard after the minimum jaxlib is 0.10.0.
+    if not hasattr(_lapack, "initialize_ilp64_blas") or not hasattr(
+        _lapack, "initialize_ilp64_lapack"
+    ):
+      raise RuntimeError("ILP64 LAPACK support requires a newer jaxlib.")
+    try:
+      _lapack.initialize_ilp64_blas()
+    except Exception as e:
+      logger.info("Failed to load ILP64 BLAS: %s", e)
+    try:
+      _lapack.initialize_ilp64_lapack()
+    except Exception as e:
+      logger.info("Failed to load ILP64 LAPACK: %s", e)
+  return _build_lapack_fn_target(fn_base, dtype)
+
+
+def _build_lapack_fn_target(fn_base: str, dtype) -> str:
+  """Builds the target name for a LAPACK function custom call."""
+  try:
+    prefix = (
+        _LAPACK_DTYPE_PREFIX.get(dtype, None) or _LAPACK_DTYPE_PREFIX[dtype.type]
+    )
+    return f"lapack_{prefix}{fn_base}"
+  except KeyError as err:
+    raise NotImplementedError(err, f"Unsupported dtype {dtype}.") from err
 
 
 def register_module_custom_calls(module):
@@ -868,7 +919,7 @@ def _cholesky_cpu_lowering(ctx, operand):
   operand_aval, = ctx.avals_in
   out_aval, = ctx.avals_out
   batch_dims = operand_aval.shape[:-2]
-  target_name = lapack.prepare_lapack_call("potrf_ffi", operand_aval.dtype)
+  target_name = _prepare_lapack_call("potrf_ffi", operand_aval.dtype)
   info_aval = ShapedArray(batch_dims, np.int32)
   rule = _linalg_ffi_lowering(target_name, avals_out=[operand_aval, info_aval],
                               operand_output_aliases={0: 0})
@@ -1000,7 +1051,7 @@ def _eig_cpu_lowering(ctx, operand, *, compute_left_eigenvectors,
   avals_out = [eigvals_aval, eigvecs_aval, eigvecs_aval, info_aval]
   if real:
     avals_out = [eigvals_aval, *avals_out]
-  target_name = lapack.prepare_lapack_call("geev_ffi", operand_aval.dtype)
+  target_name = _prepare_lapack_call("geev_ffi", operand_aval.dtype)
   rule = _linalg_ffi_lowering(target_name, avals_out=avals_out)
   *w, vl, vr, info = rule(ctx, operand,
                           compute_left=_eig_compute_attr(compute_left_eigenvectors),
@@ -1123,7 +1174,7 @@ def _eig_gpu_lowering(ctx, operand, *,
     magma = config.gpu_use_magma.value
     if implementation is not None:
       magma = "on" if implementation == EigImplementation.MAGMA else "off"
-    gpu_solver.initialize_hybrid_kernels()
+    _initialize_gpu_hybrid_kernels()
     if is_real:
       target_name = f"{target_name_prefix}hybrid_eig_real"
       complex_dtype = np.complex64 if dtype == np.float32 else np.complex128
@@ -1223,7 +1274,7 @@ def _eigh_cpu_gpu_lowering(
   if target_name_prefix == "cpu":
     dtype = operand_aval.dtype
     prefix = "he" if dtypes.issubdtype(dtype, np.complexfloating) else "sy"
-    target_name = lapack.prepare_lapack_call(f"{prefix}evd_ffi",
+    target_name = _prepare_lapack_call(f"{prefix}evd_ffi",
                                              operand_aval.dtype)
     kwargs = {
       "mode": np.uint8(ord("V")),
@@ -1322,7 +1373,7 @@ def _hessenberg_cpu_lowering(ctx, a):
   if not core.is_constant_dim(n):
     raise ValueError("hessenberg requires the last dimension of a to be "
                      f"constant, got a.shape of {a.shape}.")
-  target_name = lapack.prepare_lapack_call("gehrd_ffi", a_aval.dtype)
+  target_name = _prepare_lapack_call("gehrd_ffi", a_aval.dtype)
   avals_out = [*ctx.avals_out, ShapedArray(batch_dims, np.int32)]
   rule = _linalg_ffi_lowering(target_name, avals_out=avals_out,
                               operand_output_aliases={0: 0})
@@ -1380,7 +1431,7 @@ def _householder_product_cpu_gpu_lowering(ctx, a, taus, *,
   if target_name_prefix == "cpu":
     dtype = a_aval.dtype
     prefix = "un" if dtypes.issubdtype(dtype, np.complexfloating) else "or"
-    target_name = lapack.prepare_lapack_call(f"{prefix}gqr_ffi", dtype)
+    target_name = _prepare_lapack_call(f"{prefix}gqr_ffi", dtype)
   else:
     target_name = f"{target_name_prefix}solver_orgqr_ffi"
   rule = _linalg_ffi_lowering(target_name, operand_output_aliases={0: 0})
@@ -1539,7 +1590,7 @@ def _lu_cpu_gpu_lowering(ctx, operand, *, target_name_prefix: str):
   m = operand_aval.shape[-2]
 
   if target_name_prefix == "cpu":
-    target_name = lapack.prepare_lapack_call("getrf_ffi", operand_aval.dtype)
+    target_name = _prepare_lapack_call("getrf_ffi", operand_aval.dtype)
   else:
     target_name = f"{target_name_prefix}solver_getrf_ffi"
   rule = _linalg_ffi_lowering(target_name,
@@ -1788,7 +1839,7 @@ def _geqrf_lowering_rule(ctx, operand):
 def _geqrf_cpu_gpu_lowering(ctx, a, *, target_name_prefix: str):
   operand_aval, = ctx.avals_in
   if target_name_prefix == "cpu":
-    target_name = lapack.prepare_lapack_call("geqrf_ffi", operand_aval.dtype)
+    target_name = _prepare_lapack_call("geqrf_ffi", operand_aval.dtype)
   else:
     target_name = f"{target_name_prefix}solver_geqrf_ffi"
   rule = _linalg_ffi_lowering(target_name, operand_output_aliases={0: 0})
@@ -1832,10 +1883,10 @@ def _geqp3_dtype_rule(dtype, jpvt_dtype, *_, **__):
 def _geqp3_cpu_gpu_lowering(ctx, a, jpvt, *, use_magma, target_name_prefix):
   a_aval, _ = ctx.avals_in
   if target_name_prefix == "cpu":
-    target_name = lapack.prepare_lapack_call("geqp3_ffi", a_aval.dtype)
+    target_name = _prepare_lapack_call("geqp3_ffi", a_aval.dtype)
     params = {}
   else:
-    gpu_solver.initialize_hybrid_kernels()
+    _initialize_gpu_hybrid_kernels()
     magma = config.gpu_use_magma.value
     target_name = f"{target_name_prefix}hybrid_geqp3"
     if use_magma is not None:
@@ -1948,7 +1999,7 @@ def _schur_cpu_lowering(ctx, operand, *, compute_schur_vectors, sort_eig_vals,
   operand_aval, = ctx.avals_in
   batch_dims = operand_aval.shape[:-2]
   real = operand_aval.dtype == np.float32 or operand_aval.dtype == np.float64
-  target_name = lapack.prepare_lapack_call("gees_ffi", operand_aval.dtype)
+  target_name = _prepare_lapack_call("gees_ffi", operand_aval.dtype)
 
   info_aval = ShapedArray(batch_dims, np.dtype(np.int32))
   eigvals_aval = ShapedArray(operand_aval.shape[:-1], operand_aval.dtype)
@@ -2122,9 +2173,9 @@ def _svd_cpu_gpu_lowering(
     )
   if target_name_prefix == "cpu":
     if algorithm is None or algorithm == SvdAlgorithm.DEFAULT:
-      target_name = lapack.prepare_lapack_call("gesdd_ffi", operand_aval.dtype)
+      target_name = _prepare_lapack_call("gesdd_ffi", operand_aval.dtype)
     elif algorithm == SvdAlgorithm.QR:
-      target_name = lapack.prepare_lapack_call("gesvd_ffi", operand_aval.dtype)
+      target_name = _prepare_lapack_call("gesvd_ffi", operand_aval.dtype)
     else:
       raise NotImplementedError(
           "The SVD Jacobi and Polar algorithms are not implemented on CPU.")
@@ -2439,7 +2490,7 @@ def _triangular_solve_cpu_lower(
     a = chlo.conj(a)
     conjugate_a = False
   if np.dtype(a_aval.dtype) in _cpu_lapack_types:
-    target_name = lapack.prepare_lapack_call("trsm_ffi", a_aval.dtype)
+    target_name = _prepare_lapack_call("trsm_ffi", a_aval.dtype)
     alpha, alpha_aval, batch_partitionable = (), (), True
     rule = _linalg_ffi_lowering(target_name,
                                 [a_aval, b_aval, *alpha_aval],
@@ -2495,7 +2546,7 @@ def _tridiagonal_cpu_gpu_lowering(ctx, a, *, lower, target_name_prefix):
   if target_name_prefix == "cpu":
     real = a_aval.dtype == np.float32 or a_aval.dtype == np.float64
     prefix = "sy" if real else "he"
-    target_name = lapack.prepare_lapack_call(f"{prefix}trd_ffi", a_aval.dtype)
+    target_name = _prepare_lapack_call(f"{prefix}trd_ffi", a_aval.dtype)
     params = {"uplo": _matrix_uplo_attr(lower)}
   else:
     target_name = f"{target_name_prefix}solver_sytrd_ffi"
@@ -2541,7 +2592,7 @@ def _tridiagonal_solve_cpu_lowering(ctx, dl, d, du, b, **kwargs):
   del kwargs  # unused
   b_aval = ctx.avals_in[-1]
   batch_dims = b_aval.shape[:-2]
-  target_name = lapack.prepare_lapack_call("gtsv_ffi", b_aval.dtype)
+  target_name = _prepare_lapack_call("gtsv_ffi", b_aval.dtype)
   info_aval = ShapedArray(batch_dims, np.int32)
   rule = _linalg_ffi_lowering(target_name,
                               avals_out=[*ctx.avals_in, info_aval],

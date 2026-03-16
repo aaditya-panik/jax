@@ -2252,3 +2252,13 @@ jax_pallas_verbose_errors = bool_flag(
     default=bool_env("JAX_PALLAS_VERBOSE_ERRORS", False),
     help="If True, print verbose error messages for Pallas kernels.",
 )
+
+jax_cpu_use_ilp64_lapack = bool_state(
+    name='jax_cpu_use_ilp64_lapack',
+    default=False,
+    help=(
+        'If True, attempt to dlopen ILP64 (64-bit integer) LAPACK and BLAS '
+        'libraries (liblapack64.so and libblas64.so). This enables LAPACK '
+        'operations on matrices with more than 2^31 elements.'
+    ),
+)
