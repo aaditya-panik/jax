@@ -1132,6 +1132,21 @@ def _mgpu_async_store_op_lowering_rule(
 
 
 # TODO(olechwierowicz): remove this check once minimum jaxlib version is 0.9.2.
+if hasattr(mgpu, "AsyncStoreScalesSmemToTmemOp"):
+  @_register_lowering(mgpu.AsyncStoreScalesSmemToTmemOp)
+  def _async_copy_scales_smem_to_tmem_lowering_rule(
+      ctx: LoweringContext, op: mgpu.AsyncStoreScalesSmemToTmemOp
+  ) -> Sequence[ir.Value]:
+    [in_layout_attr] = inference_utils.in_tmem_layouts(op)
+    tmem_ref = _tmem_ref_from_ir(op.destination, in_layout_attr)
+    smem_ref = unwrap_transformed_memref(op.source, ir.ArrayAttr.get([]))
+    with utils.when(ctx.single_thread_per_warpgroup_predicate):
+      tcgen05.async_copy_scales_smem_to_tmem(
+        smem_ref, tmem_ref, collective=op.collective
+      )
+    return []
+
+# TODO(olechwierowicz): remove this check once minimum jaxlib version is 0.9.2.
 if hasattr(mgpu, "AsyncStoreSparseMetadataSmemToTmemOp"):
   @_register_lowering(mgpu.AsyncStoreSparseMetadataSmemToTmemOp)
   def _async_copy_sparse_metadata_smem_to_tmem_lowering_rule(
@@ -2066,6 +2081,23 @@ def _tmem_ref_from_ir(
   return tcgen05.TMEMRef(tmem_addr, shape, el_ty, tmem_layout)
 
 
+def _operand_to_tmem_layout_map(
+    operands: Sequence[ir.Value], in_tmem_layouts: Sequence[ir.Attribute]
+) -> dict[ir.Value, ir.Attribute]:
+  result = {}
+  index = 0
+  for op in operands:
+    if not isinstance(op.type, ir.MemRefType):
+      continue
+    mem_ref_ty = ir.MemRefType(op.type)
+    if mem_ref_ty.memory_space != utils.tmem():
+      continue
+
+    result[op] = in_tmem_layouts[index]
+    index += 1
+  return result
+
+
 def _tmem_ref_to_ir(ref: tcgen05.TMEMRef) -> ir.Value:
   """Returns an IR value from a TMEMRef."""
   ty = ir.MemRefType.get(ref.shape, ref.dtype, memory_space=utils.tmem())
@@ -2078,14 +2110,23 @@ def _tmem_ref_to_ir(ref: tcgen05.TMEMRef) -> ir.Value:
 def _tcgen05_mma_op_lowering_rule(
     ctx: LoweringContext, op: mgpu.TcGen05MMAOp
 ) -> Sequence[ir.Value]:
-  if op.a_sparse_metadata is not None:
-    raise NotImplementedError("Sparse metadata not yet implemented.")
-
   ctx.check_collective(op)
 
   in_tmem_layouts = inference_utils.in_tmem_layouts(op)
-  acc_layout = in_tmem_layouts[0]
-  acc_ref = _tmem_ref_from_ir(op.accumulator, acc_layout)
+  ref_to_tmem_layout = _operand_to_tmem_layout_map(op.operands, in_tmem_layouts)
+  acc_ref = _tmem_ref_from_ir(op.accumulator, ref_to_tmem_layout[op.accumulator])
+
+  a_sparse_metadata = None
+  if op.a_sparse_metadata is not None:
+    a_sparse_metadata = _tmem_ref_from_ir(
+        op.a_sparse_metadata, ref_to_tmem_layout[op.a_sparse_metadata]
+    )
+  a_scale = None
+  if op.a_scale is not None:
+    a_scale = _tmem_ref_from_ir(op.a_scale, ref_to_tmem_layout[op.a_scale])
+  b_scale = None
+  if op.b_scale is not None:
+    b_scale = _tmem_ref_from_ir(op.b_scale, ref_to_tmem_layout[op.b_scale])
 
   if utils.is_smem_ref(op.a):
     a_transforms, b_transforms = inference_utils.in_transforms(op)
@@ -2107,10 +2148,11 @@ def _tcgen05_mma_op_lowering_rule(
         b_ref,
         a_swizzle=a_swizzle,
         b_swizzle=b_swizzle,
-        a_scale=op.a_scale,
-        b_scale=op.b_scale,
+        a_scale=a_scale,
+        b_scale=b_scale,
         accumulate=op.accumulate,
         collective=op.collective.value,
+        a_sparse_metadata=a_sparse_metadata,
     )
 
   return []

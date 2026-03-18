@@ -2064,12 +2064,6 @@ def _tcgen05_mma_lowering_wg(
     scaled: bool,
     sparse: bool,
 ):
-  del a_scale_transforms_tree, b_scale_transforms_tree, a_sparse_metadata_transforms_tree
-  if scaled or sparse:
-    raise NotImplementedError(
-        "Scaled and sparse MMAs not supported for WG semantics."
-    )
-
   (
       acc_aval,
       a_aval,
@@ -2093,19 +2087,25 @@ def _tcgen05_mma_lowering_wg(
   if scaled:
     # Scales are not supported for WG semantics, but we still need to unpack them
     # if they are present in the leaves/avals to get to the transforms.
-    _, _, leaves = leaves[0], leaves[1], leaves[2:]
-    _, _, avals = avals[0], avals[1], avals[2:]
+    a_scale_ref, b_scale_ref, leaves = leaves[0], leaves[1], leaves[2:]
+    a_scale_ref_aval, b_scale_ref_aval, avals = avals[0], avals[1], avals[2:]
+  else:
+    a_scale_ref = b_scale_ref = a_scale_ref_aval = b_scale_ref_aval = None
 
   if sparse:
-    # Sparse metadata is not supported for WG semantics.
-    _, leaves = leaves[0], leaves[1:]
-    _, avals = avals[0], avals[1:]
+    a_sparse_metadata_ref, leaves = leaves[0], leaves[1:]
+    a_sparse_metadata_ref_aval, avals = avals[0], avals[1:]
+  else:
+    a_sparse_metadata_ref = a_sparse_metadata_ref_aval = None
 
   transforms_trees = (
       acc_transforms_tree,
       a_transforms_tree,
       b_transforms_tree,
       barrier_transforms_tree,
+      a_scale_transforms_tree,
+      b_scale_transforms_tree,
+      a_sparse_metadata_transforms_tree,
   )
   ns = [getattr(tree, "num_leaves", 0) for tree in transforms_trees]
   transforms_leaves_lists = util.split_list_checked(leaves, ns)
@@ -2116,13 +2116,19 @@ def _tcgen05_mma_lowering_wg(
       a_transforms_leaves,
       b_transforms_leaves,
       barrier_transforms_leaves,
+      a_scale_transforms_leaves,
+      b_scale_transforms_leaves,
+      a_sparse_metadata_transforms_leaves,
   ) = transforms_leaves_lists
 
   (
       acc_transforms_leaves_avals,
       a_transforms_leaves_avals,
       b_transforms_leaves_avals,
-      barrier_transforms_leaves_avals,
+      _,
+      a_scale_transforms_leaves_avals,
+      b_scale_transforms_leaves_avals,
+      a_sparse_metadata_transforms_leaves_avals,
   ) = transforms_avals_lists
 
   if acc_transforms_tree is not None:
@@ -2167,6 +2173,37 @@ def _tcgen05_mma_lowering_wg(
     if base_index is not None:
       barrier_ref = barrier_ref[base_index]
 
+  if a_scale_ref is not None and a_scale_transforms_tree is not None:
+    assert isinstance(a_scale_ref_aval, state.AbstractRef)
+    a_scale_transforms = a_scale_transforms_tree.unflatten(
+        a_scale_transforms_leaves
+    )
+    a_scale_transform_avals = a_scale_transforms_tree.unflatten(
+        a_scale_transforms_leaves_avals
+    )
+    a_scale_ref, _, a_scale_transforms = lowering._handle_transforms(
+        ctx, a_scale_ref_aval, a_scale_ref, a_scale_transform_avals,
+        a_scale_transforms
+    )
+    if a_scale_transforms:
+      raise NotImplementedError(
+          f"Unsupported transforms: {a_scale_transforms}"
+      )
+  if b_scale_ref is not None and b_scale_transforms_tree is not None:
+    assert isinstance(b_scale_ref_aval, state.AbstractRef)
+    b_scale_transforms = b_scale_transforms_tree.unflatten(
+        b_scale_transforms_leaves
+    )
+    b_scale_transform_avals = b_scale_transforms_tree.unflatten(
+        b_scale_transforms_leaves_avals
+    )
+    b_scale_ref, _, b_scale_transforms = lowering._handle_transforms(
+        ctx, b_scale_ref_aval, b_scale_ref, b_scale_transform_avals,
+        b_scale_transforms
+    )
+    if b_scale_transforms:
+      raise NotImplementedError(f"Unsupported transforms: {b_scale_transforms}")
+
   predicate_ctx: contextlib.AbstractContextManager[None]
   if collective_axis is not None:
     predicate_ctx = mgpu.when(_collective_mma_predicate(ctx, collective_axis))
@@ -2179,6 +2216,26 @@ def _tcgen05_mma_lowering_wg(
     i1 = ir.IntegerType.get_signless(1)
     accumulate = arith_dialect.constant(i1, accumulate)
 
+  if a_sparse_metadata_transforms_tree is not None:
+    a_sparse_metadata_transforms = a_sparse_metadata_transforms_tree.unflatten(
+        a_sparse_metadata_transforms_leaves
+    )
+    a_sparse_metadata_transform_avals = (
+        a_sparse_metadata_transforms_tree.unflatten(
+            a_sparse_metadata_transforms_leaves_avals
+        )
+    )
+    assert isinstance(a_sparse_metadata_ref_aval, state_types.AbstractRef)
+    a_sparse_metadata_ref, _, a_sparse_metadata_transforms = (
+        lowering._handle_transforms(  # pyrefly: ignore[bad-specialization]
+            ctx, a_sparse_metadata_ref_aval, a_sparse_metadata_ref,
+            a_sparse_metadata_transform_avals, a_sparse_metadata_transforms)
+    )
+    if a_sparse_metadata_transforms:
+      raise NotImplementedError(
+          f"Unsupported transforms: {a_sparse_metadata_transforms}"
+      )
+
   with predicate_ctx:
     mgpu.dialect.tcgen05_mma(
         acc_ref,
@@ -2186,6 +2243,9 @@ def _tcgen05_mma_lowering_wg(
         b_ref,
         accumulate=accumulate,
         collective=collective,
+        a_scale=a_scale_ref,
+        b_scale=b_scale_ref,
+        a_sparse_metadata=a_sparse_metadata_ref,
     )
     if arrive:
       assert isinstance(barrier_ref, mgpu.DialectBarrierRef)
@@ -3456,6 +3516,22 @@ def _async_copy_to_tmem_lowering_rule(
 def _async_copy_scales_to_tmem_lowering_rule(*args, **kwargs):
   return _async_copy_to_tmem_lowering_rule(
       tcgen05.async_copy_scales_smem_to_tmem, *args, **kwargs
+  )
+
+
+@lowering.register_lowering_rule(
+    async_copy_scales_to_tmem_p, mgpu.LoweringSemantics.Warpgroup
+)
+def _async_copy_scales_to_tmem_lowering_rule_wg(*args, **kwargs):
+  # TODO(olechwierowicz): remove this check once minimum jaxlib version is 0.9.2.
+  if not hasattr(mgpu.dialect, "async_store_scales_smem_to_tmem"):
+    raise NotImplementedError(
+        "async_copy_scales_to_tmem_p WG lowering is not implemented."
+    )
+  return _async_copy_to_tmem_lowering_rule(
+      mgpu.dialect.async_store_scales_smem_to_tmem,
+      *args,
+      **kwargs,
   )
 
 

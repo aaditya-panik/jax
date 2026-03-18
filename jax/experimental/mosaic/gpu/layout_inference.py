@@ -1343,10 +1343,6 @@ def _tcgen05_mma_constraint_system(
   assignments: dict[cs.Variable, cs.Constant] = {}
   operands_for_variable: ValueSitesForVariable = {}
 
-  is_scaled = op.a_scale is not None
-  if is_scaled:
-    raise NotImplementedError("Layout inference for block-scaled matmuls.")
-
   # TMEM
   acc = ValueSite(op, VariableType.OPERAND, 0)
   acc_variable = ctx.producer_ref(acc)
@@ -1423,6 +1419,26 @@ def _tcgen05_mma_constraint_system(
       return cs.Unsatisfiable()
     operands_for_variable[sparse_meta_var] = [sparse_meta]
 
+  if op.a_scale is not None:
+    a_scale_operand = op.a_scale
+    a_scale_index = list(op.operands).index(a_scale_operand)
+    a_scale = ValueSite(op, VariableType.OPERAND, a_scale_index)
+    a_scale_var = ctx.producer_ref(a_scale)
+    assignments[a_scale_var] = cs.TMEMLayout(tcgen05.scales_layout())
+    if not is_valid_tmem_layout_assignment(a_scale.shape, tcgen05.scales_layout()):
+      return cs.Unsatisfiable()
+    operands_for_variable[a_scale_var] = [a_scale]
+
+  if op.b_scale is not None:
+    b_scale_operand = op.b_scale
+    b_scale_index = list(op.operands).index(b_scale_operand)
+    b_scale = ValueSite(op, VariableType.OPERAND, b_scale_index)
+    b_scale_var = ctx.producer_ref(b_scale)
+    assignments[b_scale_var] = cs.TMEMLayout(tcgen05.scales_layout())
+    if not is_valid_tmem_layout_assignment(b_scale.shape, tcgen05.scales_layout()):
+      return cs.Unsatisfiable()
+    operands_for_variable[b_scale_var] = [b_scale]
+
   return cs.ConstraintSystem(assignments=assignments, constraints=constraints), operands_for_variable
 
 
@@ -1470,6 +1486,7 @@ if hasattr(mgpu, "AsyncStoreSmemToTmemOp"):
         {source_variable: [source], destination_variable: [destination]},
     )
 
+# TODO(olechwierowicz): remove this check once minimum jaxlib version is 0.9.2.
 if hasattr(mgpu, "AsyncStoreSparseMetadataSmemToTmemOp"):
   @_add_constraint_system_derivation_rule(
       mgpu.AsyncStoreSparseMetadataSmemToTmemOp
@@ -1487,6 +1504,29 @@ if hasattr(mgpu, "AsyncStoreSparseMetadataSmemToTmemOp"):
             assignments={
                 destination_variable: cs.TMEMLayout(
                     tcgen05.sparse_meta_layout()
+                ),
+                source_variable: cs.SMEMTiling(None),
+            },
+        ),
+        {source_variable: [source], destination_variable: [destination]},
+    )
+
+# TODO(olechwierowicz): remove this check once minimum jaxlib version is 0.9.2.
+if hasattr(mgpu, "AsyncStoreScalesSmemToTmemOp"):
+  @_add_constraint_system_derivation_rule(mgpu.AsyncStoreScalesSmemToTmemOp)
+  def _async_store_scales_smem_to_tmem_constraint_system(
+      ctx: DerivationContext,
+      op: mgpu.AsyncStoreScalesSmemToTmemOp,
+  ) -> ConstraintSystemDerivationRuleResult:
+    source = ValueSite(op, VariableType.OPERAND, 0)
+    source_variable = ctx.producer_ref(source)
+    destination = ValueSite(op, VariableType.OPERAND, 1)
+    destination_variable = ctx.producer_ref(destination)
+    return (
+        cs.ConstraintSystem(
+            assignments={
+                destination_variable: cs.TMEMLayout(
+                    tcgen05.scales_layout()
                 ),
                 source_variable: cs.SMEMTiling(None),
             },
@@ -1855,7 +1895,10 @@ def _compute_swizzle(
     )
 
   minor_tiling = tiling[np.argmin(strides[-len(tiling):])]
-  swizzle = minor_tiling * utils.bytewidth(ref_ty.element_type)
+  swizzle = minor_tiling * utils.bitwidth(ref_ty.element_type)
+  if swizzle % 8:
+    raise ValueError(f"Swizzle is not byte aligned, got: {swizzle}")
+  swizzle //= 8
   assert swizzle in (
       mgpu.SwizzlingMode.k128ByteSwizzle,
       mgpu.SwizzlingMode.k64ByteSwizzle,

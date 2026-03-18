@@ -3359,7 +3359,6 @@ class PallasCallWGTest(
     actual_missing_primitives = (lane_wg_lowered_primitives -
                                  wg_wg_lowered_primitives)
     expected_missing_primitives = {
-        mgpu_primitives.async_copy_scales_to_tmem_p,
         mgpu_primitives.semaphore_signal_parallel_p,
         mgpu_primitives.semaphore_signal_multicast_p,
         mgpu_primitives.try_cluster_cancel_p,
@@ -4326,7 +4325,6 @@ class PallasCallTCGen05Test(PallasTCGen05Test):
       dtype=[jnp.float8_e5m2, jnp.float8_e4m3fn, jnp.float4_e2m1fn],
   )
   def test_simple_scaled_matmul(self, m, n, dtype):
-    self.skip_if_wg_semantics()
     # TODO(apaszke): Add support for single-buffering in pallas_call.
     causes_oom = jnp.finfo(dtype).bits == 8 and n == 256
     k = 128 if causes_oom else 256
@@ -4403,7 +4401,7 @@ class PallasCallTCGen05Test(PallasTCGen05Test):
       scale_jax_dtype=[jnp.float8_e8m0fnu, jnp.float8_e4m3fn],
   )
   def test_collective_scaled_matmul(self, m, n, scale_jax_dtype):
-    self.skip_if_wg_semantics()
+    self.skip_if_wg_semantics() # leader_tracked for copy_gmem_to_smem is unsupported in WG semantics
 
     in_jax_dtype = jnp.float4_e2m1fn
     out_jax_dtype = jnp.float32
@@ -4525,7 +4523,6 @@ class PallasCallTCGen05Test(PallasTCGen05Test):
       dtype=[jnp.float16],
   )
   def test_simple_sparse_matmul(self, m, n, dtype):
-    self.skip_if_wg_semantics()
     k = 128
     swizzle = 128 // jnp.dtype(dtype).itemsize
     transforms = self.default_transforms(swizzle=swizzle, dtype=dtype)
