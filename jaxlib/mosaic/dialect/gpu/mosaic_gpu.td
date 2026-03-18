@@ -266,6 +266,16 @@ def MosaicGPU_TileShapeOp : Op<MosaicGPU_Dialect, "tile_shape",
   let results = (outs AnyMemRef);
 }
 
+def MosaicGPU_OOBFillMode : I32EnumAttr<"OOBFillMode",
+    "Out of bounds fill mode for TMA.",
+    [
+      I32EnumAttrCase<"Undefined", 0, "undefined">,
+      I32EnumAttrCase<"PromiseInBounds", 1, "promise_in_bounds">,
+      I32EnumAttrCase<"Zeros", 2, "zeros">
+    ]>{
+  let cppNamespace = "::mosaic_gpu";
+}
+
 def MosaicGPU_AsyncLoadOp : Op<MosaicGPU_Dialect, "async_load",
       [AttrSizedOperandSegments]> {
   let summary = "Schedules an async load of a MemRef from GMEM to SMEM";
@@ -314,7 +324,8 @@ def MosaicGPU_AsyncLoadOp : Op<MosaicGPU_Dialect, "async_load",
 
     // Attributes
     DenseI64ArrayAttr:$slice_lengths,
-    TypedArrayAttrBase<MosaicGPU_Dimension, "dimensions">:$collective
+    TypedArrayAttrBase<MosaicGPU_Dimension, "dimensions">:$collective,
+    DefaultValuedAttr<MosaicGPU_OOBFillMode, "OOBFillMode::Undefined">:$oob_fill_mode
   );
 
   let hasVerifier = 1;
