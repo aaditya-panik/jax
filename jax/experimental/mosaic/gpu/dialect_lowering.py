@@ -1545,26 +1545,27 @@ def _mgpu_arrive_op_lowering_rule(
 
 @_register_lowering(mgpu.ArriveExpectTxOp)
 def _mgpu_arrive_expect_tx_op_lowering_rule(
-    _: LoweringContext, arrive_expect_tx_op: mgpu.ArriveExpectTxOp
+    ctx: LoweringContext, arrive_expect_tx_op: mgpu.ArriveExpectTxOp
 ) -> Sequence[ir.Value]:
   # pyrefly: ignore[bad-assignment]
   num_bytes: int = arrive_expect_tx_op.expect_tx.value
-  if num_bytes % utils.WARPGROUP_SIZE:
-    raise NotImplementedError(
-        "Only copies of a multiple of 128 bytes are supported"
+  i32 = ir.IntegerType.get_signless(32)
+  if num_bytes % utils.WARPGROUP_SIZE == 0:
+    # Prefer uniform arrival whenever possible because it's more efficient.
+    # We arrive uniformly from each thread in the WG, so we need to divide the
+    # number of bytes by the number of threads in the WG.
+    tx_bytes = utils.c(num_bytes // utils.WARPGROUP_SIZE, i32)
+  else:
+    tx_bytes = arith.select(
+        ctx.single_thread_per_warpgroup_predicate,
+        utils.c(num_bytes, i32),
+        utils.c(0, i32),
     )
-  # We arrive uniformly from each thread in the WG, so we need to divide the
-  # number of bytes by the number of threads in the WG.
-  # TODO(dasenov): Relax this. We can just select the WG leader and have it
-  # arrive with the whole transfer size, while everyone else arrives with 0.
-  # But we should continue using this scheme as it's likely to be faster.
-  num_bytes //= utils.WARPGROUP_SIZE
-  num_bytes = utils.c(num_bytes, ir.IntegerType.get_signless(32))
 
   barrier = utils.DialectBarrierRef.from_barrier_memref(
       arrive_expect_tx_op.barrier
   )
-  utils.nvvm_mbarrier_arrive_expect_tx(barrier.get_ptr(), num_bytes)
+  utils.nvvm_mbarrier_arrive_expect_tx(barrier.get_ptr(), tx_bytes)
 
   return []
 
@@ -2459,6 +2460,29 @@ def _index_switch_op_lowering_rule(
         ctx, block, new_block, scf.YieldOp, []
     )
   return _unflatten_ir_values(new_switch_op.results, results_template)
+
+# TODO(b/415721295): remove this check once minimum jaxlib version is 0.10.0
+if hasattr(mgpu, "TryClusterCancelOp"):
+  @_register_lowering(mgpu.TryClusterCancelOp)
+  def _try_cluster_cancel_op_lowering_rule(
+      ctx: LoweringContext, op: mgpu.TryClusterCancelOp
+  ) -> Sequence[ir.Value]:
+    barrier = utils.DialectBarrierRef.from_barrier_memref(op.barrier)
+    predicate = ctx.single_thread_per_warpgroup_predicate
+    if op.predicate is not None:
+      predicate = arith.andi(predicate, op.predicate)
+    utils.try_cluster_cancel(op.cancellation_result, barrier.barrier_ref, predicate)
+    return []
+
+
+# TODO(b/415721295): remove this check once minimum jaxlib version is 0.10.0
+if hasattr(mgpu, "QueryClusterCancelOp"):
+  @_register_lowering(mgpu.QueryClusterCancelOp)
+  def _query_cluster_cancel_op_lowering_rule(
+      ctx: LoweringContext, op: mgpu.QueryClusterCancelOp
+  ) -> Sequence[ir.Value]:
+    del ctx
+    return utils.query_cluster_cancel(op.cancellation_result)
 
 
 @_register_lowering(func.FuncOp)
