@@ -930,7 +930,7 @@ def _as_jax_callable(
   if not isinstance(out_type, collections.abc.Iterable):
     out_type = (out_type,)
     unpack = True
-  out_avals = tuple(core.ShapedArray(ty.shape, ty.dtype) for ty in out_type)
+  out_avals = tuple(core.ShapedArray(ty.shape, ty.dtype, sharding=ty.sharding, manual_type=ty.manual_type) for ty in out_type)
 
   # We use jax.jit to make sure we hit the fast compilation cache.
   def apply_kernel(*args):
